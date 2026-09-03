@@ -23,7 +23,7 @@ and your own pull and merge requests, all in one panel.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/ariadev/omarchy-dev-git.git --enable --yes
+omarchy plugin add https://github.com/tanevanwifferen/omarchy-dev-git.git --enable --yes
 ```
 
 Needs `curl` and `jq`, plus any of [gh](https://cli.github.com/),

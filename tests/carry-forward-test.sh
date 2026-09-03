@@ -7,7 +7,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/helper.sh"
 
 echo "carry-forward"
 
-readonly SCHEMA=3
+readonly SCHEMA=4
 NOW=$(date -u +%s)
 CUTOFF=$((NOW - 6 * 3600))
 

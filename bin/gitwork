@@ -12,9 +12,15 @@
 
 set -uo pipefail
 
-readonly SCHEMA_VERSION=3
+readonly SCHEMA_VERSION=4
 readonly STALE_WINDOW_SEC=$((6 * 3600))
 readonly GITLAB_PAGE_CAP=40
+# A host that told us to back off is left alone until it says otherwise, and
+# never for longer than the window in which its last good record still counts.
+readonly MAX_BACKOFF_SEC=$((3 * 3600))
+# GitHub reports its own remaining budget; stop well short of zero so an
+# unrelated `gh` session on the same token never runs into the wall.
+readonly GITHUB_MIN_POINTS=50
 LIB_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly LIB_DIR
 
@@ -195,9 +201,9 @@ http_get() {
 }
 
 http_graphql() {
-  local url=$1 payload=$2 body=$3
+  local url=$1 payload=$2 body=$3 headers=${4:-/dev/null}
   curl -sS --max-time "$req_timeout" \
-    -o "$body" -w '%{http_code}' \
+    -o "$body" -D "$headers" -w '%{http_code}' \
     -X POST \
     -H 'Accept: application/json' \
     -H 'Content-Type: application/json' \
@@ -209,10 +215,86 @@ http_graphql() {
 
 header_value() {
   local file=$1 name=$2
+  [[ -r $file ]] || return 0
   tr -d '\r' <"$file" | awk -v n="$(printf '%s' "$name" | tr 'A-Z' 'a-z')" '
     { split($0, kv, ":"); k = tolower(kv[1]) }
-    k == n { sub(/^[^:]*:[ ]*/, ""); print; exit }
+    k == n { sub(/^[^:]*:[ ]*/, ""); sub(/[ \t]+$/, ""); print; exit }
   '
+}
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+#
+# Getting throttled is the one failure mode that gets worse the harder we try,
+# so it is handled explicitly everywhere rather than falling through to the
+# generic "could not reach" path, which would keep hammering the host every
+# refresh interval. Three rules:
+#
+#   1. A 429, or a 403 that comes with an exhausted budget, is read as "come
+#      back at T" rather than as a broken token.
+#   2. That T is written into the record as `retryAfter`, and the next run
+#      skips the host entirely until it passes — zero requests, not fewer.
+#   3. The last good record carries forward meanwhile, so the panel keeps
+#      showing yesterday's queues marked stale instead of going blank.
+
+# Seconds to wait, or nothing when the response was not a throttle.
+rate_limit_pause() {
+  local headers=$1 status=$2 retry remaining reset now
+  [[ $status == 429 || $status == 403 ]] || return 1
+
+  retry=$(header_value "$headers" "retry-after")
+  [[ $retry =~ ^[0-9]+$ ]] && { echo "$retry"; return 0; }
+
+  remaining=$(header_value "$headers" "x-ratelimit-remaining")
+  reset=$(header_value "$headers" "x-ratelimit-reset")
+  if [[ $remaining == 0 ]]; then
+    if [[ $reset =~ ^[0-9]+$ ]]; then
+      now=$(date -u +%s)
+      ((reset > now)) && { echo $((reset - now)); return 0; }
+    fi
+    echo 60
+    return 0
+  fi
+
+  # A bare 429 with no advice at all still means stop.
+  [[ $status == 429 ]] && { echo 60; return 0; }
+  return 1
+}
+
+iso_in() {
+  local seconds=$1
+  ((seconds > MAX_BACKOFF_SEC)) && seconds=$MAX_BACKOFF_SEC
+  ((seconds < 30)) && seconds=30
+  date -u -d "@$(( $(date -u +%s) + seconds ))" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# The record for a host we are deliberately not talking to. It carries no data
+# of its own: the previous run's record is carried forward behind it.
+backoff_provider() {
+  local kind=$1 host=$2 is_default=$3 until_iso=$4 note=$5 elapsed=$6
+  jqm -n --arg kind "$kind" --arg host "$host" --argjson isdefault "$is_default" \
+    --arg until "$until_iso" --arg err "$note" --arg at "$(now_iso)" --argjson ms "$elapsed" \
+    'include "gitwork";
+     base_provider($kind; $host; $isdefault)
+     + {error: $err, retryAfter: $until, updatedAt: $at, elapsedMs: $ms}'
+}
+
+# The previous overview, read once before anything is collected so every host
+# can check its own back-off before opening a connection.
+PREVIOUS='null'
+if [[ -n $output && -r $output ]]; then
+  PREVIOUS=$(jq -c . "$output" 2>/dev/null || echo 'null')
+fi
+
+# Prints the deadline when this host is still serving a back-off, nothing when
+# it is free to go.
+backoff_until() {
+  local kind=$1 host=$2
+  [[ $PREVIOUS == null ]] && return 0
+  printf '%s' "$PREVIOUS" | jq -r --arg key "$kind@$host" --arg now "$(now_iso)" '
+    (.providers // []) | map(select(.key == $key)) | .[0].retryAfter // ""
+    | select(length > 0 and . > $now)' 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -242,10 +324,16 @@ CAL_DAYS=$(calendar_days "$CAL_START")
 # ---------------------------------------------------------------------------
 
 # One query covers the whole provider: identity, the trailing-year calendar,
-# and all five open-work queues. GitHub bills this as a single point of rate
-# limit and answers in one round trip.
-read -r -d '' GITHUB_QUERY <<'GQL'
+# all five open-work queues, and the build state of every request in them.
+# GitHub bills this as a single point of rate limit and answers in one round
+# trip, so the pipeline view costs no request of its own.
+#
+# `__PR_CI__` is filled in below, and blanked for the retry: the status rollup
+# is missing from older GitHub Enterprise schemas, and a schema error there
+# would otherwise take the whole host down with it.
+read -r -d '' GITHUB_QUERY_TEMPLATE <<'GQL'
 query {
+  rateLimit { remaining resetAt }
   viewer {
     login
     name
@@ -268,6 +356,7 @@ fragment pr on PullRequest {
   author { login }
   comments { totalCount }
   repository { nameWithOwner }
+  __PR_CI__
 }
 fragment issue on Issue {
   number title url updatedAt
@@ -276,6 +365,11 @@ fragment issue on Issue {
   repository { nameWithOwner }
 }
 GQL
+
+GITHUB_PR_CI='commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
+GITHUB_QUERY="${GITHUB_QUERY_TEMPLATE/__PR_CI__/$GITHUB_PR_CI}"
+GITHUB_QUERY_PLAIN="${GITHUB_QUERY_TEMPLATE/__PR_CI__/}"
+readonly GITHUB_QUERY GITHUB_QUERY_PLAIN
 
 github_endpoint() {
   case "$1" in
@@ -309,9 +403,16 @@ unready_provider() {
 
 collect_github() {
   local host=$1 is_default=$2 out=$3
-  local started token status help
+  local started token status help until pause
   started=$(now_ms)
   ERR_FILE="$tmp/gh-$host.err"; : >"$ERR_FILE"
+
+  until=$(backoff_until github "$host")
+  if [[ -n $until ]]; then
+    backoff_provider github "$host" "$is_default" "$until" \
+      "Rate limited by $host until $until" 0 >"$out"
+    return
+  fi
 
   token=$(github_token "$host"); rc=$?
   if ((rc != 0)); then
@@ -331,7 +432,25 @@ collect_github() {
 
   AUTH_HEADER=(-H "Authorization: bearer $token")
   jq -n --arg q "$GITHUB_QUERY" '{query: $q}' >"$tmp/gh-$host.payload"
-  status=$(http_graphql "$(github_endpoint "$host")" "$tmp/gh-$host.payload" "$tmp/gh-$host.json")
+  status=$(http_graphql "$(github_endpoint "$host")" "$tmp/gh-$host.payload" \
+    "$tmp/gh-$host.json" "$tmp/gh-$host.head")
+
+  # Being throttled is not being logged out: name it, and tell the next run
+  # when to come back rather than retrying into the same wall.
+  if pause=$(rate_limit_pause "$tmp/gh-$host.head" "$status"); then
+    until=$(iso_in "$pause")
+    backoff_provider github "$host" "$is_default" "$until" \
+      "Rate limited by $host until $until" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+
+  # An older GitHub Enterprise has no status rollup in its schema. Retry once
+  # without it rather than reporting the whole host as broken.
+  if [[ $status == 2* ]] && jq -e '(.errors // []) | length > 0' "$tmp/gh-$host.json" >/dev/null 2>&1; then
+    jq -n --arg q "$GITHUB_QUERY_PLAIN" '{query: $q}' >"$tmp/gh-$host.payload"
+    status=$(http_graphql "$(github_endpoint "$host")" "$tmp/gh-$host.payload" \
+      "$tmp/gh-$host.json" "$tmp/gh-$host.head")
+  fi
 
   if [[ $status == 401 || $status == 403 ]]; then
     unready_provider github "$host" "$is_default" \
@@ -354,6 +473,7 @@ collect_github() {
   jqm --arg host "$host" --argjson isdefault "$is_default" --arg at "$(now_iso)" \
     --argjson ms $(( $(now_ms) - started )) \
     --argjson start "$CAL_START" --argjson days "$CAL_DAYS" \
+    --argjson floor "$GITHUB_MIN_POINTS" \
     'include "gitwork";
      .data as $gh
      | ($gh.viewer.login // "") as $viewer
@@ -374,13 +494,22 @@ collect_github() {
          assignedPrs: github_items($gh.assignedPrs.nodes; $viewer),
          authoredPrs: github_items($gh.authoredPrs.nodes; $viewer),
          assignedIssues: github_items($gh.assignedIssues.nodes; $viewer),
-         authoredIssues: github_items($gh.authoredIssues.nodes; $viewer) }
+         authoredIssues: github_items($gh.authoredIssues.nodes; $viewer),
+         # GitHub hands back its own remaining budget, so a token that is
+         # nearly spent (by us or by anything else using it) parks itself
+         # until the window resets instead of finding out the hard way.
+         retryAfter: (if ($gh.rateLimit.remaining // 999999) < $floor
+                      then ($gh.rateLimit.resetAt // "") else "" end) }
+     | . + { failingCi: ci_rows([.reviewRequests, .assignedPrs, .authoredPrs]; "failed") }
      | . + { totals: totals([
          ["reviewRequests", ($gh.reviewRequests.issueCount // 0), (.reviewRequests | length)],
          ["assignedPrs",    ($gh.assignedPrs.issueCount // 0),    (.assignedPrs | length)],
          ["authoredPrs",    ($gh.authoredPrs.issueCount // 0),    (.authoredPrs | length)],
          ["assignedIssues", ($gh.assignedIssues.issueCount // 0), (.assignedIssues | length)],
-         ["authoredIssues", ($gh.authoredIssues.issueCount // 0), (.authoredIssues | length)]]) }
+         ["authoredIssues", ($gh.authoredIssues.issueCount // 0), (.authoredIssues | length)],
+         ["ciFailing", 0, (.failingCi | length)],
+         ["ciRunning", 0,
+          (ci_rows([.reviewRequests, .assignedPrs, .authoredPrs]; "running") | length)]]) }
     ' "$tmp/gh-$host.json" >"$out" 2>>"$ERR_FILE"
 
   [[ -s $out ]] || unready_provider github "$host" "$is_default" \
@@ -401,7 +530,7 @@ github_error() {
 # Identity plus all three merge-request queues in one request. Issues come over
 # REST because the root `issues` GraphQL field needs a username we do not have
 # yet, while REST's `scope=` filters work off the token alone.
-read -r -d '' GITLAB_QUERY <<'GQL'
+read -r -d '' GITLAB_QUERY_TEMPLATE <<'GQL'
 query {
   currentUser {
     username
@@ -416,8 +545,18 @@ fragment mr on MergeRequest {
   iid title webUrl updatedAt draft approved userNotesCount
   author { username }
   project { fullPath }
+  __MR_CI__
 }
 GQL
+
+# The head pipeline rides along with the merge requests we already ask for, so
+# the pipeline view adds no request. Old self-managed instances may not know
+# the field, and a schema error fails the whole query, so the plain form is
+# kept for one retry.
+GITLAB_MR_CI='headPipeline { status }'
+GITLAB_QUERY="${GITLAB_QUERY_TEMPLATE/__MR_CI__/$GITLAB_MR_CI}"
+GITLAB_QUERY_PLAIN="${GITLAB_QUERY_TEMPLATE/__MR_CI__/}"
+readonly GITLAB_QUERY GITLAB_QUERY_PLAIN
 
 gitlab_token() {
   local host=$1
@@ -463,14 +602,23 @@ gitlab_calendar() {
   [[ $pages =~ ^[0-9]+$ ]] || pages=1
   ((pages > GITLAB_PAGE_CAP)) && pages=$GITLAB_PAGE_CAP
 
+  # The remaining pages are the largest burst this collector makes anywhere, so
+  # they go out in small batches rather than all at once, and the moment the
+  # instance answers 429 the rest are abandoned — a partial calendar is worth
+  # far less than a working token.
+  local batch=0
   for ((n = 2; n <= pages; n++)); do
+    [[ -f $prefix.throttled ]] && break
     (
       if ! s=$(http_get "$base/api/v4/events?after=$after&per_page=100&sort=asc&page=$n" \
                  "$prefix-$n.json" "$prefix-$n.head") || [[ $s != 2* ]]; then
+        [[ $s == 429 ]] && : >"$prefix.throttled"
         echo '[]' >"$prefix-$n.json"
       fi
       jq -e 'type == "array"' "$prefix-$n.json" >/dev/null 2>&1 || echo '[]' >"$prefix-$n.json"
     ) &
+    batch=$((batch + 1))
+    ((batch % 6 == 0)) && wait
   done
   wait
 
@@ -482,9 +630,16 @@ gitlab_calendar() {
 
 collect_gitlab() {
   local host=$1 is_default=$2 out=$3
-  local started token status base help
+  local started token status base help until pause
   started=$(now_ms)
   ERR_FILE="$tmp/gl-$host.err"; : >"$ERR_FILE"
+
+  until=$(backoff_until gitlab "$host")
+  if [[ -n $until ]]; then
+    backoff_provider gitlab "$host" "$is_default" "$until" \
+      "Rate limited by $host until $until" 0 >"$out"
+    return
+  fi
 
   token=$(gitlab_token "$host"); rc=$?
   if ((rc != 0)); then
@@ -508,13 +663,30 @@ collect_gitlab() {
 
   # The four calls are independent, so they fly together rather than in turn.
   local graph_status_file="$tmp/gl-$host.status"
-  ( http_graphql "$base/api/graphql" "$tmp/gl-$host.payload" "$tmp/gl-$host.json" >"$graph_status_file" ) &
+  ( http_graphql "$base/api/graphql" "$tmp/gl-$host.payload" "$tmp/gl-$host.json" \
+      "$tmp/gl-$host.head" >"$graph_status_file" ) &
   ( gitlab_issues "$base" assigned_to_me "$tmp/gl-$host.assigned.json" "$tmp/gl-$host.assigned.total" ) &
   ( gitlab_issues "$base" created_by_me "$tmp/gl-$host.authored.json" "$tmp/gl-$host.authored.total" ) &
   ( gitlab_calendar "$base" "$host" "$tmp/gl-$host.calendar.json" ) &
   wait
 
   status=$(cat "$graph_status_file" 2>/dev/null)
+
+  if pause=$(rate_limit_pause "$tmp/gl-$host.head" "$status"); then
+    until=$(iso_in "$pause")
+    backoff_provider gitlab "$host" "$is_default" "$until" \
+      "Rate limited by $host until $until" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
+
+  # An instance too old for `headPipeline` rejects the whole query; ask again
+  # without the pipeline rather than losing the host over a decoration.
+  if [[ $status == 2* ]] && jq -e '(.errors // []) | length > 0' "$tmp/gl-$host.json" >/dev/null 2>&1; then
+    jq -n --arg q "$GITLAB_QUERY_PLAIN" '{query: $q}' >"$tmp/gl-$host.payload"
+    status=$(http_graphql "$base/api/graphql" "$tmp/gl-$host.payload" \
+      "$tmp/gl-$host.json" "$tmp/gl-$host.head")
+  fi
+
   if [[ $status == 401 || $status == 403 ]]; then
     unready_provider gitlab "$host" "$is_default" \
       "Token rejected by $host. Run: glab auth login --hostname $host" "" $(( $(now_ms) - started )) >"$out"
@@ -570,12 +742,16 @@ collect_gitlab() {
          authoredPrs: gitlab_mr_items($u.authoredMergeRequests.nodes; $viewer),
          assignedIssues: gitlab_issue_items($assigned[0]; $viewer),
          authoredIssues: gitlab_issue_items($authored[0]; $viewer) }
+     | . + { failingCi: ci_rows([.reviewRequests, .assignedPrs, .authoredPrs]; "failed") }
      | . + { totals: totals([
          ["reviewRequests", ($u.reviewRequestedMergeRequests.count // 0), (.reviewRequests | length)],
          ["assignedPrs",    ($u.assignedMergeRequests.count // 0),        (.assignedPrs | length)],
          ["authoredPrs",    ($u.authoredMergeRequests.count // 0),        (.authoredPrs | length)],
          ["assignedIssues", $assignedTotal, (.assignedIssues | length)],
-         ["authoredIssues", $authoredTotal, (.authoredIssues | length)]]) }
+         ["authoredIssues", $authoredTotal, (.authoredIssues | length)],
+         ["ciFailing", 0, (.failingCi | length)],
+         ["ciRunning", 0,
+          (ci_rows([.reviewRequests, .assignedPrs, .authoredPrs]; "running") | length)]]) }
     ' "$tmp/gl-$host.json" >"$out" 2>>"$ERR_FILE"
 
   [[ -s $out ]] || unready_provider gitlab "$host" "$is_default" \
@@ -633,10 +809,17 @@ gitea_search() {
 
 collect_gitea() {
   local host=$1 is_default=$2 out=$3
-  local started token status base help prefix entry name params rc
+  local started token status base help prefix entry name params rc until pause
   started=$(now_ms)
   prefix="$tmp/gt-$host"
   ERR_FILE="$prefix.err"; : >"$ERR_FILE"
+
+  until=$(backoff_until gitea "$host")
+  if [[ -n $until ]]; then
+    backoff_provider gitea "$host" "$is_default" "$until" \
+      "Rate limited by $host until $until" 0 >"$out"
+    return
+  fi
 
   token=$(gitea_token "$host"); rc=$?
   if ((rc != 0)) || [[ -z $token ]]; then
@@ -653,6 +836,12 @@ collect_gitea() {
   AUTH_HEADER=(-H "Authorization: token $token")
 
   status=$(http_get "$base/api/v1/user" "$prefix.user.json" "$prefix.user.head")
+  if pause=$(rate_limit_pause "$prefix.user.head" "$status"); then
+    until=$(iso_in "$pause")
+    backoff_provider gitea "$host" "$is_default" "$until" \
+      "Rate limited by $host until $until" $(( $(now_ms) - started )) >"$out"
+    return
+  fi
   if [[ $status == 401 || $status == 403 ]]; then
     unready_provider gitea "$host" "$is_default" \
       "Token rejected by $host. Run: tea login add --url $base" "" $(( $(now_ms) - started )) >"$out"
@@ -722,7 +911,9 @@ collect_gitea() {
          ["assignedPrs",    $assignedPrsTotal,    (.assignedPrs | length)],
          ["authoredPrs",    $authoredPrsTotal,    (.authoredPrs | length)],
          ["assignedIssues", $assignedIssuesTotal, (.assignedIssues | length)],
-         ["authoredIssues", $authoredIssuesTotal, (.authoredIssues | length)]]) }
+         ["authoredIssues", $authoredIssuesTotal, (.authoredIssues | length)],
+         ["ciFailing", 0, 0],
+         ["ciRunning", 0, 0]]) }
     ' >"$out" 2>>"$ERR_FILE"
 
   [[ -s $out ]] || unready_provider gitea "$host" "$is_default" \
@@ -784,14 +975,10 @@ fi
 # Assemble and land atomically
 # ---------------------------------------------------------------------------
 
-previous='null'
-if [[ -n $output && -r $output ]]; then
-  previous=$(jq -c . "$output" 2>/dev/null || echo 'null')
-fi
-
+# Read once, before collection, so every host could check its own back-off.
 document=$(jqm -n \
   --argjson providers "$providers_json" \
-  --argjson previous "$previous" \
+  --argjson previous "$PREVIOUS" \
   --argjson schema "$SCHEMA_VERSION" \
   --argjson cutoff "$(( $(date -u +%s) - STALE_WINDOW_SEC ))" \
   --arg at "$(now_iso)" \

@@ -58,7 +58,7 @@ assert_eq "2" "$("$COLLECTOR" -output >/dev/null 2>&1; echo $?)" "a flag without
 
 doc=$(run_dead -pretty false)
 assert_eq "0" "$(jq -e . <<<"$doc" >/dev/null 2>&1; echo $?)" "the output is valid JSON"
-assert_eq "3" "$(jq -r .schemaVersion <<<"$doc")" "the schema version is declared"
+assert_eq "4" "$(jq -r .schemaVersion <<<"$doc")" "the schema version is declared"
 assert_eq "0" "$(jq -r '.updatedAt | fromdateiso8601 | if . > 0 then 0 else 1 end' <<<"$doc")" \
   "updatedAt is a parseable timestamp"
 assert_eq "number" "$(jq -r '.elapsedMs | type' <<<"$doc")" "elapsedMs is reported"
@@ -69,7 +69,7 @@ assert_eq "2" "$(jq -r '.providers | length' <<<"$doc")" "both providers are pre
 required='["key","kind","name","host","hostLabel","defaultHost","ready","stale","staleAt",
   "username","displayName","webUrl","userUrl","authHelpText","error","updatedAt","elapsedMs",
   "mrTerm","mrTermShort","calendar","reviewRequests","assignedPrs","authoredPrs",
-  "assignedIssues","authoredIssues","totals"]'
+  "assignedIssues","authoredIssues","failingCi","retryAfter","totals"]'
 assert_eq "0" "$(jq -r --argjson want "$required" \
   '[.providers[] | keys_unsorted as $have | $want - $have] | flatten | length' <<<"$doc")" \
   "every provider carries every field the panel reads"
@@ -134,7 +134,7 @@ assert_contains "$(grep -c 'mv -f "\$output.tmp" "\$output"' "$COLLECTOR")" "1" 
 # A second run reads the first as its previous document and must not corrupt it.
 run_dead -output "$out" >/dev/null
 assert_eq "0" "$(jq -e . "$out" >/dev/null 2>&1; echo $?)" "a repeat run leaves valid JSON"
-assert_eq "3" "$(jq -r .schemaVersion "$out")" "a repeat run keeps the schema version"
+assert_eq "4" "$(jq -r .schemaVersion "$out")" "a repeat run keeps the schema version"
 
 # --- formatting ------------------------------------------------------------
 

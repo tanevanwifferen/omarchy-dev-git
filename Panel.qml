@@ -28,6 +28,26 @@ Panel {
   readonly property string glyphApproved: "󰄬" // check
   readonly property string glyphStreak: "󰈸"   // flame
   readonly property string glyphRefresh: "󰑐"  // refresh
+  // The build marker is a plain dot: the colour is the message, and a dot
+  // reads the same in every font the bar might be using.
+  readonly property string glyphCi: "●"
+
+  // Green passing, red failing, amber still moving, grey decided by neither.
+  function ciColor(state) {
+    if (state === "failed") return root.urgent
+    if (state === "success") return root.accent
+    if (state === "running") return Qt.lighter(root.urgent, 1.45)
+    return root.dim
+  }
+
+  // GitHub runs checks, GitLab and Gitea run pipelines; the panel says
+  // whichever word the user's provider says.
+  function ciTerm(kind) { return kind === "github" ? "CHECKS" : "PIPELINES" }
+
+  // Gitea answers its queues from one search endpoint that reports no build
+  // state at all, and asking per row would cost one request each — exactly the
+  // kind of fan-out that gets a token throttled. So it simply has no CI view.
+  readonly property bool ciSupported: !!root.provider && root.provider.kind !== "gitea"
 
   // ---------------------------------------------------------------- selection
 
@@ -162,6 +182,10 @@ Panel {
     var term = p.mrTermShort.toUpperCase()
     add("review", "AWAITING YOUR REVIEW", p.reviewRequests,
         p.totals.reviewRequests, root.glyphRequest, true)
+    // Red builds ride on the requests we already fetched, so this section is
+    // free; it sits high because it is the shortest and the most actionable.
+    add("ci", "FAILING " + root.ciTerm(p.kind), p.failingCi,
+        p.totals.ciFailing, root.glyphRequest, true)
     add("assigned", "ASSIGNED " + term, p.assignedPrs,
         p.totals.assignedPrs, root.glyphRequest, false)
     add("mine", "YOUR OPEN " + term, p.authoredPrs,
@@ -317,7 +341,11 @@ Panel {
     // when it was actually collected, not from the failed attempt.
     var ago = root.timeAgo(p.stale ? p.staleAt : p.updatedAt, root.nowMs)
     var when = ago === "" || ago === "just now" ? "JUST NOW" : ago.toUpperCase() + " AGO"
-    return (p.stale ? "STALE · FROM " : "UPDATED ") + when
+    var line = (p.stale ? "STALE · FROM " : "UPDATED ") + when
+    // A host that asked us to back off is deliberately not being refreshed;
+    // say so, or the panel just looks broken until the window passes.
+    if (p.retryAfter !== "") line += " · RATE LIMITED UNTIL " + root.clockOf(p.retryAfter)
+    return line
   }
 
   function heroIdentity(p) {
@@ -349,6 +377,10 @@ Panel {
       if (category === "assigned") return prs + encodeURIComponent("assignee:@me")
       if (category === "assignedIssues") return issues + encodeURIComponent("assignee:@me")
       if (category === "authoredIssues") return issues + encodeURIComponent("author:@me")
+      // GitHub's own search understands the check state, so the failing box
+      // opens the same list it counts.
+      if (category === "ciFailing") return prs + encodeURIComponent("author:@me status:failure")
+      if (category === "ciRunning") return prs + encodeURIComponent("author:@me status:pending")
       return prs + encodeURIComponent("author:@me")
     }
     // Gitea's dashboard takes the whole queue in one `type`, and uses the same
@@ -369,7 +401,18 @@ Panel {
     if (category === "assigned") return mrQueue + "&assignee_username=" + user
     if (category === "assignedIssues") return issueQueue + "&assignee_username=" + user
     if (category === "authoredIssues") return issueQueue + "&author_username=" + user
+    // GitLab's dashboard cannot filter merge requests by pipeline state, so
+    // the CI boxes land on the authored queue the rows came from.
+    if (category === "ciFailing" || category === "ciRunning")
+      return mrQueue + "&author_username=" + user
     return mrQueue + "&author_username=" + user
+  }
+
+  // "2026-08-01T14:30:00Z" -> "16:30" in the user's own timezone.
+  function clockOf(iso) {
+    var when = new Date(iso)
+    if (isNaN(when.getTime())) return ""
+    return Qt.formatDateTime(when, "HH:mm")
   }
 
   function originOf(url) {
@@ -981,6 +1024,28 @@ Panel {
                 glyph: root.glyphIssue
                 onActivated: root.openUrl(root.categoryUrl("authoredIssues"))
               }
+
+              // Both counts come from the requests already on screen, so they
+              // cost nothing to show and vanish on a provider that cannot
+              // report them rather than reading a confident zero.
+              StatBox {
+                width: parent.cellWidth
+                visible: root.ciSupported
+                value: root.provider ? Number(root.provider.totals.ciFailing || 0) : 0
+                label: root.provider ? "FAILING " + root.ciTerm(root.provider.kind) : ""
+                glyph: root.glyphCi
+                urgent: value > 0
+                onActivated: root.openUrl(root.categoryUrl("ciFailing"))
+              }
+
+              StatBox {
+                width: parent.cellWidth
+                visible: root.ciSupported
+                value: root.provider ? Number(root.provider.totals.ciRunning || 0) : 0
+                label: root.provider ? "RUNNING " + root.ciTerm(root.provider.kind) : ""
+                glyph: root.glyphCi
+                onActivated: root.openUrl(root.categoryUrl("ciRunning"))
+              }
             }
           }
 
@@ -1321,6 +1386,9 @@ Panel {
     readonly property bool approved: item ? item.review === "approved" : false
     readonly property bool changesRequested: item ? item.review === "changes_requested" : false
     readonly property int comments: item ? item.comments : 0
+    // Empty on a provider that does not report one, and on a request that has
+    // never run a build; either way the marker stays off.
+    readonly property string ci: item && item.ci ? item.ci : ""
     // The collector only fills this in when somebody else opened the row, so
     // your own queues stay uncluttered.
     readonly property string author: item && item.author ? item.author : ""
@@ -1408,6 +1476,7 @@ Panel {
           id: rowMeta
           width: Math.min(implicitWidth,
             metaRow.width - rowGlyph.width - metaRow.spacing
+              - (rowCi.visible ? rowCi.width + metaRow.spacing : 0)
               - (rowComments.visible ? rowComments.width + metaRow.spacing : 0))
           text: workRow.repository
             + (workRow.item && workRow.item.number > 0 ? "  #" + workRow.item.number : "")
@@ -1416,6 +1485,15 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideLeft
+        }
+
+        Text {
+          id: rowCi
+          visible: workRow.ci !== ""
+          text: root.glyphCi
+          color: root.ciColor(workRow.ci)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
         }
 
         Text {

@@ -14,7 +14,11 @@ and your own pull and merge requests, all in one panel.
   and Gitea are discovered from `gh`/`glab`/`tea` config, each with its own
   identity, graph and queues, behind a host switch inside the tab
 - **Open-work grid** — awaiting review, assigned PRs/MRs, assigned and authored
-  issues; each click opens the pre-filtered queue page
+  issues, failing and running builds; each click opens the pre-filtered queue
+  page
+- **Checks and pipelines** — every request carries its build state as a
+  coloured dot, and the red ones collect into their own section. It rides along
+  with the request queues, so it costs no extra API call
 - **Queue rows** carrying draft tag, approval check, comment count, repository,
   number and age
 - A dot on the bar icon when something is waiting on your review
@@ -70,19 +74,41 @@ available — `omarchy-shell dev.git refresh` refreshes without opening.
 `~/.local/state/omarchy/git/overview.json`, which the panel watches. It is a
 bash script with its JSON transforms in `bin/gitwork.jq`.
 
-GitHub needs one GraphQL request per host for identity, calendar and all five
-queues. GitLab takes one GraphQL request for identity and merge requests, REST
-for issues, and the events feed for the calendar — it has no calendar API — with
-page one reporting the page count so the rest are fetched together. Gitea has no
+GitHub needs one GraphQL request per host for identity, calendar, all five
+queues and the check rollup on every request in them. GitLab takes one GraphQL request for identity, merge requests and their head
+pipelines, REST for issues, and the events feed for the calendar — it has no
+calendar API — with page one reporting the page count so the rest are fetched
+in small batches. Gitea has no
 GraphQL at all, but its issue search takes each queue as query parameters and
 answers pulls and issues from one row shape, so identity comes first and then
-the five queues and the heatmap fly together.
+the five queues and the heatmap fly together. That search reports no build
+state, and asking per row would cost one request each, so Gitea shows no CI
+view rather than a confident zero.
+
+A schema that predates the check rollup or `headPipeline` — an older
+self-managed instance — makes the whole query fail, so the collector retries
+that host once without the CI fields instead of losing it over a decoration.
 
 Every host is collected in its own subshell, so a run costs the slowest single
 host rather than the sum of them. A host that cannot be reached carries its last
 good record forward for up to six hours, marked stale, so a dropped VPN does not
 blank a working dashboard. An authentication failure is not carried: that data
 is genuinely gone.
+
+### Staying under the rate limit
+
+Every queue this panel shows is answered by a request that was already being
+made, so adding the CI view added no traffic. On top of that:
+
+- A `429`, or a `403` that arrives with an exhausted budget, is read as *come
+  back at T* rather than as a broken token, and `T` is stored on the record.
+- The next run skips that host entirely until `T` passes — zero requests, not
+  fewer — and the panel says `RATE LIMITED UNTIL 16:30` over the last good data
+  rather than looking broken.
+- GitHub reports its own remaining budget, so a token nearly spent by anything
+  at all (including your own `gh` session) parks itself until the window resets.
+- The GitLab events feed is the only place that pages, and it goes out six
+  requests at a time, abandoning the rest the moment the instance answers 429.
 
 ## Settings
 

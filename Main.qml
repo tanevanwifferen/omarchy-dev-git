@@ -13,7 +13,7 @@ Item {
 
   property var settings: ({})
 
-  readonly property int schemaVersion: 3
+  readonly property int schemaVersion: 4
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || home + "/.local/state"
@@ -164,6 +164,10 @@ Item {
         draft: raw.draft === true,
         author: String(raw.author || ""),
         review: String(raw.review || ""),
+        // "", "success", "failed", "running", "canceled", "skipped" or
+        // "manual" — the collector has already flattened every provider's
+        // own vocabulary onto this set.
+        ci: String(raw.ci || ""),
         comments: Number(raw.comments || 0)
       })
     }
@@ -216,6 +220,12 @@ Item {
       authoredPrs: normalizeItems(record.authoredPrs),
       assignedIssues: normalizeItems(record.assignedIssues),
       authoredIssues: normalizeItems(record.authoredIssues),
+      // Assembled by the collector out of the request queues above, so a red
+      // build is one section rather than a hunt through three lists.
+      failingCi: normalizeItems(record.failingCi),
+      // Set when the host asked us to back off; the collector honours it on
+      // the next run, and the panel says so rather than looking broken.
+      retryAfter: String(record.retryAfter || ""),
       totals: record.totals && typeof record.totals === "object" ? record.totals : ({})
     }
   }

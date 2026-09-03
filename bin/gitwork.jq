@@ -99,6 +99,32 @@ def other_author($author; $viewer):
   if ($author | length) == 0 or ($author | ascii_downcase) == ($viewer | ascii_downcase)
   then "" else $author end;
 
+# Every provider spells its build state differently; the panel only wants to
+# know whether it is red, green, moving, or none of your business. Anything
+# unrecognised becomes "", which renders as no marker at all rather than as a
+# wrong one.
+def ci_state($raw):
+  ($raw // "" | ascii_downcase) as $s
+  | if $s == "success" or $s == "passed" then "success"
+    elif $s == "failure" or $s == "failed" or $s == "error" then "failed"
+    elif $s == "pending" or $s == "running" or $s == "created"
+      or $s == "preparing" or $s == "waiting_for_resource" or $s == "scheduled"
+      then "running"
+    elif $s == "canceled" or $s == "cancelled" then "canceled"
+    elif $s == "skipped" then "skipped"
+    elif $s == "manual" or $s == "expected" then "manual"
+    else "" end;
+
+# The pipeline section is assembled from the request queues we already hold, so
+# it costs no extra request. A merge request can sit in more than one queue —
+# yours and awaiting your review — so rows are deduplicated by url, newest
+# first.
+def ci_rows($queues; $state):
+  [ $queues[]? | .[]? | select(.ci == $state) ]
+  | unique_by(.url)
+  | sort_by(.updatedAt)
+  | reverse;
+
 def base_provider($kind; $host; $is_default):
   { key: ($kind + "@" + $host),
     kind: $kind,
@@ -119,6 +145,7 @@ def base_provider($kind; $host; $is_default):
     error: "",
     updatedAt: "",
     elapsedMs: 0,
+    retryAfter: "",
     mrTerm: (if $kind == "gitlab" then "Merge requests" else "Pull requests" end),
     mrTermShort: (if $kind == "gitlab" then "MRs" else "PRs" end),
     calendar: empty_calendar,
@@ -127,6 +154,7 @@ def base_provider($kind; $host; $is_default):
     authoredPrs: [],
     assignedIssues: [],
     authoredIssues: [],
+    failingCi: [],
     totals: {} };
 
 def github_items($nodes; $viewer):
@@ -139,6 +167,7 @@ def github_items($nodes; $viewer):
       draft: (.isDraft // false),
       author: other_author((.author.login // ""); $viewer),
       review: (.reviewDecision // "" | ascii_downcase),
+      ci: ci_state(.commits.nodes[0].commit.statusCheckRollup.state),
       comments: (.comments.totalCount // 0) } ];
 
 def gitlab_mr_items($nodes; $viewer):
@@ -151,6 +180,7 @@ def gitlab_mr_items($nodes; $viewer):
       draft: (.draft // false),
       author: other_author((.author.username // ""); $viewer),
       review: (if .approved then "approved" else "" end),
+      ci: ci_state(.headPipeline.status),
       comments: (.userNotesCount // 0) } ];
 
 # "group/project#12" -> "group/project"
@@ -167,11 +197,13 @@ def gitlab_issue_items($rows; $viewer):
       draft: false,
       author: other_author((.author.username // ""); $viewer),
       review: "",
+      ci: "",
       comments: (.user_notes_count // 0) } ];
 
 # Gitea's issue search answers pulls and issues from one endpoint and one row
-# shape, so both queues share this. It reports no review decision anywhere in
-# the search response, so `review` stays empty rather than guessing.
+# shape, so both queues share this. It reports neither a review decision nor a
+# build state anywhere in the search response, and asking for either would cost
+# one request per row, so both stay empty rather than guessing.
 def gitea_items($rows; $viewer):
   [ $rows[]? | select((.html_url // "") != "") |
     { number: (.number // 0),
@@ -182,6 +214,7 @@ def gitea_items($rows; $viewer):
       draft: (.pull_request.draft // false),
       author: other_author((.user.login // ""); $viewer),
       review: "",
+      ci: "",
       comments: (.comments // 0) } ];
 
 def counts_from_github_calendar:
@@ -222,6 +255,7 @@ def carry_forward($previous; $schema; $cutoff):
                                updatedAt: $cur.updatedAt,
                                elapsedMs: $cur.elapsedMs,
                                error: $cur.error,
+                               retryAfter: ($cur.retryAfter // ""),
                                authHelpText: $cur.authHelpText }
                 end
             end

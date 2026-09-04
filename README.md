@@ -77,8 +77,8 @@ bash script with its JSON transforms in `bin/gitwork.jq`.
 GitHub needs one GraphQL request per host for identity, calendar, all five
 queues and the check rollup on every request in them. GitLab takes one GraphQL request for identity, merge requests and their head
 pipelines, REST for issues, and the events feed for the calendar — it has no
-calendar API — with page one reporting the page count so the rest are fetched
-in small batches. Gitea has no
+calendar API — walked newest-first in small batches until a short page ends it.
+Gitea has no
 GraphQL at all, but its issue search takes each queue as query parameters and
 answers pulls and issues from one row shape, so identity comes first and then
 the five queues and the heatmap fly together. That search reports no build
@@ -109,6 +109,8 @@ made, so adding the CI view added no traffic. On top of that:
   at all (including your own `gh` session) parks itself until the window resets.
 - The GitLab events feed is the only place that pages, and it goes out six
   requests at a time, abandoning the rest the moment the instance answers 429.
+  It is walked newest-first and capped at 150 pages, so a year that outruns the
+  cap loses its oldest week rather than its most recent months.
 
 ## Settings
 

@@ -14,7 +14,15 @@ set -uo pipefail
 
 readonly SCHEMA_VERSION=4
 readonly STALE_WINDOW_SEC=$((6 * 3600))
-readonly GITLAB_PAGE_CAP=40
+# A year of a busy account runs well past the 4 000 events the old cap of 40
+# pages allowed, and the shortfall showed up as a calendar that simply stopped
+# months ago. The ceiling stays — an unbounded walk is how you get throttled —
+# but it is high enough that a normal year fits inside it, and the walk now
+# stops on its own as soon as a page comes back short.
+readonly GITLAB_PAGE_CAP=150
+readonly GITLAB_PAGE_SIZE=100
+# Pages go out in small waves rather than all at once.
+readonly GITLAB_PAGE_BATCH=6
 # A host that told us to back off is left alone until it says otherwise, and
 # never for longer than the window in which its last good record still counts.
 readonly MAX_BACKOFF_SEC=$((3 * 3600))
@@ -581,46 +589,69 @@ gitlab_issues() {
   header_value "$out.head" "X-Total" | grep -E '^[0-9]+$' >"$total_out" || echo 0 >"$total_out"
 }
 
+# One page of the events feed, landing an array in $2 whatever happens. A page
+# that comes back with fewer rows than it could hold is the end of the feed, and
+# says so by touching $prefix.end; a 429 stops the walk through $prefix.throttled.
+gitlab_events_page() {
+  local url=$1 body=$2 head=$3 prefix=$4
+  local status rows
+  status=$(http_get "$url" "$body" "$head")
+  if [[ $status != 2* ]] || ! jq -e 'type == "array"' "$body" >/dev/null 2>&1; then
+    [[ $status == 429 || $status == 403 ]] && : >"$prefix.throttled"
+    echo '[]' >"$body"
+    : >"$prefix.end"
+    return 1
+  fi
+  rows=$(jq -r 'length' "$body" 2>/dev/null || echo 0)
+  ((rows < GITLAB_PAGE_SIZE)) && : >"$prefix.end"
+  return 0
+}
+
 # GitLab has no contribution-calendar API, and /users/x/calendar.json is not
 # reliably available on self-managed instances, so the year is reconstructed
-# from the events feed. Page one reports the total page count, so every
-# remaining page is fetched at once rather than walked serially.
+# from the events feed.
+#
+# The feed is walked newest-first. That matters: the walk is capped, and an
+# account that outruns the cap has to lose its oldest week rather than its most
+# recent months — a graph that fades at the far left is a graph; one that stops
+# in June is a bug report. Page one reports the page count when the instance
+# offers it, and the walk stops on its own at the first short page either way,
+# so a header GitLab omits past 10 000 rows no longer truncates the year.
 gitlab_calendar() {
   local base=$1 host=$2 out=$3
-  local after url status pages n prefix
+  local after url pages n prefix first last
   after=$(date -u -d "@$((CAL_START - 86400))" +%Y-%m-%d)
   prefix="$tmp/gl-$host-events"
-  url="$base/api/v4/events?after=$after&per_page=100&sort=asc&page=1"
+  rm -f "$prefix.end" "$prefix.throttled"
+  url="$base/api/v4/events?after=$after&per_page=$GITLAB_PAGE_SIZE&sort=desc&page=1"
 
-  status=$(http_get "$url" "$prefix-1.json" "$prefix-1.head")
-  if [[ $status != 2* ]] || ! jq -e 'type == "array"' "$prefix-1.json" >/dev/null 2>&1; then
+  if ! gitlab_events_page "$url" "$prefix-001.json" "$prefix-001.head" "$prefix"; then
     jqm -n 'include "gitwork"; empty_calendar' >"$out"
     return
   fi
 
-  pages=$(header_value "$prefix-1.head" "X-Total-Pages")
-  [[ $pages =~ ^[0-9]+$ ]] || pages=1
+  pages=$(header_value "$prefix-001.head" "X-Total-Pages")
+  # No page count is not "one page": large accounts are exactly where GitLab
+  # drops the header, so an absent count walks to the cap or to the short page.
+  [[ $pages =~ ^[0-9]+$ ]] && ((pages > 0)) || pages=$GITLAB_PAGE_CAP
   ((pages > GITLAB_PAGE_CAP)) && pages=$GITLAB_PAGE_CAP
 
   # The remaining pages are the largest burst this collector makes anywhere, so
-  # they go out in small batches rather than all at once, and the moment the
+  # they go out in small waves rather than all at once, and the moment the
   # instance answers 429 the rest are abandoned — a partial calendar is worth
   # far less than a working token.
-  local batch=0
-  for ((n = 2; n <= pages; n++)); do
-    [[ -f $prefix.throttled ]] && break
-    (
-      if ! s=$(http_get "$base/api/v4/events?after=$after&per_page=100&sort=asc&page=$n" \
-                 "$prefix-$n.json" "$prefix-$n.head") || [[ $s != 2* ]]; then
-        [[ $s == 429 ]] && : >"$prefix.throttled"
-        echo '[]' >"$prefix-$n.json"
-      fi
-      jq -e 'type == "array"' "$prefix-$n.json" >/dev/null 2>&1 || echo '[]' >"$prefix-$n.json"
-    ) &
-    batch=$((batch + 1))
-    ((batch % 6 == 0)) && wait
+  for ((first = 2; first <= pages; first += GITLAB_PAGE_BATCH)); do
+    [[ -f $prefix.throttled || -f $prefix.end ]] && break
+    last=$((first + GITLAB_PAGE_BATCH - 1))
+    ((last > pages)) && last=$pages
+    for ((n = first; n <= last; n++)); do
+      ( gitlab_events_page \
+          "$base/api/v4/events?after=$after&per_page=$GITLAB_PAGE_SIZE&sort=desc&page=$n" \
+          "$(printf '%s-%03d.json' "$prefix" "$n")" \
+          "$(printf '%s-%03d.head' "$prefix" "$n")" "$prefix" >/dev/null ) &
+    done
+    wait
   done
-  wait
 
   jqm -s --argjson start "$CAL_START" --argjson days "$CAL_DAYS" \
     'include "gitwork";
